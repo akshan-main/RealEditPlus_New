@@ -19,12 +19,14 @@ sys.path.append("./stable_diffusion")
 from ldm.modules.attention import CrossAttention
 from ldm.util import instantiate_from_config
 from metrics.clip_similarity import ClipSimilarity
+from contextlib import nullcontext # added to support non-gpu autocast
 
 
 ################################################################################
 # Modified K-diffusion Euler ancestral sampler with prompt-to-prompt.
 # https://github.com/crowsonkb/k-diffusion/blob/master/k_diffusion/sampling.py
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # added to support non-gpu runtime
 
 def append_dims(x, target_dims):
     """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
@@ -72,7 +74,7 @@ def sample_euler_ancestral(model, x, sigmas, prompt2prompt_threshold=0.0, **extr
 
 def load_model_from_config(config, ckpt, vae_ckpt=None, verbose=False):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
+    pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False) #added weights_only=False
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
@@ -222,10 +224,10 @@ def main():
         ckpt=opt.ckpt,
         vae_ckpt=opt.vae_ckpt,
     )
-    model.cuda().eval()
+    model.eval().to(device) #changed gpu (cuda) to device
     model_wrap = k_diffusion.external.CompVisDenoiser(model)
 
-    clip_similarity = ClipSimilarity().cuda()
+    clip_similarity = ClipSimilarity().to(device) #changed gpu (cuda) to device
 
     out_dir = Path(opt.out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
@@ -236,7 +238,9 @@ def main():
     print(f"Partition index {opt.partition} ({opt.partition + 1} / {opt.n_partitions})")
     prompts = np.array_split(list(enumerate(prompts)), opt.n_partitions)[opt.partition]
 
-    with torch.no_grad(), torch.autocast("cuda"), model.ema_scope():
+    autocast_context = torch.autocast("cuda") if device.type == "cuda" else nullcontext()
+
+    with torch.no_grad(), autocast_context, model.ema_scope():
         uncond = model.get_learned_conditioning(2 * [""])
         sigmas = model_wrap.get_sigmas(opt.steps)
 
@@ -258,7 +262,7 @@ def main():
                         continue
                     torch.manual_seed(seed)
 
-                    x = torch.randn(1, 4, 512 // 8, 512 // 8, device="cuda") * sigmas[0]
+                    x = torch.randn(1, 4, 512 // 8, 512 // 8, device=device) * sigmas[0]
                     x = repeat(x, "1 ... -> n ...", n=2)
 
                     model_wrap_cfg = CFGDenoiser(model_wrap)
