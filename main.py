@@ -17,9 +17,10 @@ import torch.distributed as dist
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities.distributed import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
-from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.loggers import TensorBoardLogger
 
 sys.path.append("./stable_diffusion")
 
@@ -126,13 +127,13 @@ def get_parser(**parser_kwargs):
     )
     return parser
 
-
+"""
 def nondefault_trainer_args(opt):
     parser = argparse.ArgumentParser()
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args([])
     return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
-
+"""
 
 class WrappedDataset(Dataset):
     """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
@@ -357,7 +358,7 @@ class ImageLogger(Callback):
         self.batch_freq = batch_frequency
         self.max_images = max_images
         self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
+            TensorBoardLogger: self._testtube,
         }
         self.log_steps = [2 ** n for n in range(6, int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -540,7 +541,7 @@ if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-    parser = Trainer.add_argparse_args(parser)
+    #parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
 
@@ -583,8 +584,10 @@ if __name__ == "__main__":
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
         trainer_config["accelerator"] = "ddp"
+        """
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
+        """
         if not "gpus" in trainer_config:
             del trainer_config["accelerator"]
             cpu = True
@@ -714,7 +717,7 @@ if __name__ == "__main__":
 
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
-        trainer = Trainer.from_argparse_args(trainer_opt, plugins=DDPPlugin(find_unused_parameters=False), **trainer_kwargs)
+        trainer = Trainer(**trainer_kwargs, strategy=DDPStrategy(find_unused_parameters=False))
         trainer.logdir = logdir  ###
 
         # data

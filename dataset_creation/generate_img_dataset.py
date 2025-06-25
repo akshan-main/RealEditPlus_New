@@ -12,6 +12,9 @@ from omegaconf import OmegaConf
 from PIL import Image
 from pytorch_lightning import seed_everything
 from tqdm import tqdm
+from torchvision.transforms import ToTensor, Normalize, Resize, Compose
+
+#from torchvision.transforms.functional import to_tensor, resize, normalize
 
 sys.path.append("./")
 sys.path.append("./stable_diffusion")
@@ -19,14 +22,12 @@ sys.path.append("./stable_diffusion")
 from ldm.modules.attention import CrossAttention
 from ldm.util import instantiate_from_config
 from metrics.clip_similarity import ClipSimilarity
-from contextlib import nullcontext # added to support non-gpu autocast
 
 
 ################################################################################
 # Modified K-diffusion Euler ancestral sampler with prompt-to-prompt.
 # https://github.com/crowsonkb/k-diffusion/blob/master/k_diffusion/sampling.py
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # added to support non-gpu runtime
 
 def append_dims(x, target_dims):
     """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
@@ -70,11 +71,21 @@ def sample_euler_ancestral(model, x, sigmas, prompt2prompt_threshold=0.0, **extr
 
 
 ################################################################################
+import torch
+from pytorch_lightning.callbacks import ModelCheckpoint
+
+torch.serialization.add_safe_globals({
+    'pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint': ModelCheckpoint
+})
 
 
 def load_model_from_config(config, ckpt, vae_ckpt=None, verbose=False):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False) #added weights_only=False
+    torch.serialization.add_safe_globals({
+        'pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint': ModelCheckpoint
+    })
+
+    pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
@@ -114,6 +125,16 @@ def to_pil(image: torch.Tensor) -> Image.Image:
     image = Image.fromarray(image.astype(np.uint8))
     return image
 
+preprocess = Compose([
+    Resize((512, 512), interpolation=Image.BICUBIC),
+    ToTensor(),
+    Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # [-1,1] normalization
+])
+
+def load_and_preprocess_image(img_path, device):
+    img = Image.open(img_path).convert("RGB")
+    img_tensor = preprocess(img).unsqueeze(0).to(device)
+    return img_tensor
 
 def main():
     parser = argparse.ArgumentParser()
@@ -224,10 +245,10 @@ def main():
         ckpt=opt.ckpt,
         vae_ckpt=opt.vae_ckpt,
     )
-    model.eval().to(device) #changed gpu (cuda) to device
+    model.cuda().eval()
     model_wrap = k_diffusion.external.CompVisDenoiser(model)
 
-    clip_similarity = ClipSimilarity().to(device) #changed gpu (cuda) to device
+    clip_similarity = ClipSimilarity().cuda()
 
     out_dir = Path(opt.out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
@@ -238,9 +259,7 @@ def main():
     print(f"Partition index {opt.partition} ({opt.partition + 1} / {opt.n_partitions})")
     prompts = np.array_split(list(enumerate(prompts)), opt.n_partitions)[opt.partition]
 
-    autocast_context = torch.autocast("cuda") if device.type == "cuda" else nullcontext()
-
-    with torch.no_grad(), autocast_context, model.ema_scope():
+    with torch.no_grad(), torch.autocast("cuda"), model.ema_scope():
         uncond = model.get_learned_conditioning(2 * [""])
         sigmas = model_wrap.get_sigmas(opt.steps)
 
@@ -262,12 +281,21 @@ def main():
                         continue
                     torch.manual_seed(seed)
 
-                    x = torch.randn(1, 4, 512 // 8, 512 // 8, device=device) * sigmas[0]
+                    orig_img_tensor = load_and_preprocess_image(prompt["image"], device="cuda")
+                    with torch.no_grad():
+                        z_orig = model.get_first_stage_encoding(model.encode_first_stage(orig_img_tensor))  # (1,4,64,64)
+
+                    # Add noise according to sigma[0]
+                    x = z_orig + torch.randn_like(z_orig) * sigmas[0]
+
+                    # Repeat for batch
                     x = repeat(x, "1 ... -> n ...", n=2)
 
                     model_wrap_cfg = CFGDenoiser(model_wrap)
-                    p2p_threshold = opt.min_p2p + torch.rand(()).item() * (opt.max_p2p - opt.min_p2p)
-                    cfg_scale = opt.min_cfg + torch.rand(()).item() * (opt.max_cfg - opt.min_cfg)
+                    #p2p_threshold = opt.min_p2p + torch.rand(()).item() * (opt.max_p2p - opt.min_p2p)
+                    #cfg_scale = opt.min_cfg + torch.rand(()).item() * (opt.max_cfg - opt.min_cfg)
+                    p2p_threshold = 0.6
+                    cfg_scale = 7
                     extra_args = {"cond": cond, "uncond": uncond, "cfg_scale": cfg_scale}
                     samples_ddim = sample_euler_ancestral(model_wrap_cfg, x, sigmas, p2p_threshold, **extra_args)
                     x_samples_ddim = model.decode_first_stage(samples_ddim)
@@ -302,6 +330,7 @@ def main():
                 and result["clip_sim_0"] >= opt.clip_threshold
                 and result["clip_sim_1"] >= opt.clip_threshold
             ]
+            print(f"Number of samples passing CLIP filter: {len(metadata)} / {len(results)}")
             metadata.sort(reverse=True)
             for _, seed in metadata[: opt.max_out_samples]:
                 result = results[seed]
